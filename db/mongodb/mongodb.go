@@ -2,43 +2,46 @@ package mongodb
 
 import (
 	"container/heap"
-	"github.com/name5566/leaf/log"
-	"gopkg.in/mgo.v2"
-	"gopkg.in/mgo.v2/bson"
+	"context"
 	"sync"
 	"time"
+
+	"github.com/name5566/leaf/log"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
-// session
-type Session struct {
-	*mgo.Session
+// Client holds a MongoDB client
+type Client struct {
+	*mongo.Client
 	ref   int
 	index int
 }
 
-// session heap
-type SessionHeap []*Session
+// Client heap
+type ClientHeap []*Client
 
-func (h SessionHeap) Len() int {
+func (h ClientHeap) Len() int {
 	return len(h)
 }
 
-func (h SessionHeap) Less(i, j int) bool {
+func (h ClientHeap) Less(i, j int) bool {
 	return h[i].ref < h[j].ref
 }
 
-func (h SessionHeap) Swap(i, j int) {
+func (h ClientHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].index = i
 	h[j].index = j
 }
 
-func (h *SessionHeap) Push(s interface{}) {
-	s.(*Session).index = len(*h)
-	*h = append(*h, s.(*Session))
+func (h *ClientHeap) Push(s interface{}) {
+	s.(*Client).index = len(*h)
+	*h = append(*h, s.(*Client))
 }
 
-func (h *SessionHeap) Pop() interface{} {
+func (h *ClientHeap) Pop() interface{} {
 	l := len(*h)
 	s := (*h)[l-1]
 	s.index = -1
@@ -46,88 +49,105 @@ func (h *SessionHeap) Pop() interface{} {
 	return s
 }
 
-type DialContext struct {
+type ConnectionContext struct {
 	sync.Mutex
-	sessions SessionHeap
+	clients    ClientHeap
+	clientOpts *options.ClientOptions
 }
 
 // goroutine safe
-func Dial(url string, sessionNum int) (*DialContext, error) {
-	c, err := DialWithTimeout(url, sessionNum, 10*time.Second, 5*time.Minute)
-	return c, err
+func Connect(url string, clientNum int) (*ConnectionContext, error) {
+	return ConnectWithTimeout(url, clientNum, 10*time.Second, 5*time.Minute)
 }
 
 // goroutine safe
-func DialWithTimeout(url string, sessionNum int, dialTimeout time.Duration, timeout time.Duration) (*DialContext, error) {
-	if sessionNum <= 0 {
-		sessionNum = 100
-		log.Release("invalid sessionNum, reset to %v", sessionNum)
+func ConnectWithTimeout(url string, clientNum int, connectTimeout, timeout time.Duration) (*ConnectionContext, error) {
+	if clientNum <= 0 {
+		clientNum = 100
+		log.Release("invalid clientNum, reset to %v", clientNum)
 	}
 
-	s, err := mgo.DialWithTimeout(url, dialTimeout)
-	if err != nil {
-		return nil, err
+	c := &ConnectionContext{
+		clientOpts: options.Client().
+			ApplyURI(url).
+			SetConnectTimeout(connectTimeout).
+			SetTimeout(timeout),
+		clients: make(ClientHeap, 0, clientNum),
 	}
-	s.SetSyncTimeout(timeout)
-	s.SetSocketTimeout(timeout)
 
-	c := new(DialContext)
-
-	// sessions
-	c.sessions = make(SessionHeap, sessionNum)
-	c.sessions[0] = &Session{s, 0, 0}
-	for i := 1; i < sessionNum; i++ {
-		c.sessions[i] = &Session{s.New(), 0, i}
+	for i := 0; i < clientNum; i++ {
+		newClient, err := mongo.Connect(c.clientOpts)
+		if err != nil {
+			return nil, err
+		}
+		c.clients = append(c.clients, &Client{Client: newClient, index: i})
 	}
-	heap.Init(&c.sessions)
+	heap.Init(&c.clients)
 
 	return c, nil
 }
 
 // goroutine safe
-func (c *DialContext) Close() {
+func (c *ConnectionContext) Close() {
 	c.Lock()
-	for _, s := range c.sessions {
-		s.Close()
+	defer c.Unlock()
+	for _, s := range c.clients {
+		s.Disconnect(context.Background())
 		if s.ref != 0 {
-			log.Error("session ref = %v", s.ref)
+			log.Error("client ref = %v", s.ref)
 		}
 	}
-	c.Unlock()
 }
 
 // goroutine safe
-func (c *DialContext) Ref() *Session {
+func (c *ConnectionContext) Ref() (*Client, error) {
 	c.Lock()
-	s := c.sessions[0]
+	defer c.Unlock()
+
+	s := c.clients[0]
 	if s.ref == 0 {
-		s.Refresh()
+		// Refresh the client connection only when ref is 0, as it indicates the client is not in use.
+		if err := s.Ping(context.Background(), nil); err != nil {
+			s.Disconnect(context.Background())
+			newClient, err := mongo.Connect(c.clientOpts)
+			if err != nil {
+				return nil, err
+			}
+			s.Client = newClient
+		}
 	}
 	s.ref++
-	heap.Fix(&c.sessions, 0)
-	c.Unlock()
+	heap.Fix(&c.clients, 0)
 
-	return s
+	return s, nil
 }
 
 // goroutine safe
-func (c *DialContext) UnRef(s *Session) {
+func (c *ConnectionContext) UnRef(s *Client) {
+	if s == nil {
+		return
+	}
 	c.Lock()
+	defer c.Unlock()
+
 	s.ref--
-	heap.Fix(&c.sessions, s.index)
-	c.Unlock()
+	heap.Fix(&c.clients, s.index)
 }
 
 // goroutine safe
-func (c *DialContext) EnsureCounter(db string, collection string, id string) error {
-	s := c.Ref()
+func (c *ConnectionContext) EnsureCounter(db, collection, id string) error {
+	s, err := c.Ref()
+	if err != nil {
+		return err
+	}
 	defer c.UnRef(s)
 
-	err := s.DB(db).C(collection).Insert(bson.M{
+	collectionRef := s.Database(db).Collection(collection)
+	_, err = collectionRef.InsertOne(context.Background(), bson.M{
 		"_id": id,
 		"seq": 0,
 	})
-	if mgo.IsDup(err) {
+	if mongo.IsDuplicateKeyError(err) {
 		return nil
 	} else {
 		return err
@@ -135,41 +155,53 @@ func (c *DialContext) EnsureCounter(db string, collection string, id string) err
 }
 
 // goroutine safe
-func (c *DialContext) NextSeq(db string, collection string, id string) (int, error) {
-	s := c.Ref()
+func (c *ConnectionContext) NextSeq(db, collection, id string) (int, error) {
+	s, err := c.Ref()
+	if err != nil {
+		return 0, err
+	}
 	defer c.UnRef(s)
 
+	collectionRef := s.Database(db).Collection(collection)
+	filter := bson.M{"_id": id}
+	update := bson.M{"$inc": bson.M{"seq": 1}}
+	opts := options.FindOneAndUpdate().SetReturnDocument(options.After)
+
 	var res struct {
-		Seq int
+		Seq int `bson:"seq"`
 	}
-	_, err := s.DB(db).C(collection).FindId(id).Apply(mgo.Change{
-		Update:    bson.M{"$inc": bson.M{"seq": 1}},
-		ReturnNew: true,
-	}, &res)
+	err = collectionRef.FindOneAndUpdate(context.Background(), filter, update, opts).Decode(&res)
 
 	return res.Seq, err
 }
 
 // goroutine safe
-func (c *DialContext) EnsureIndex(db string, collection string, key []string) error {
-	s := c.Ref()
-	defer c.UnRef(s)
-
-	return s.DB(db).C(collection).EnsureIndex(mgo.Index{
-		Key:    key,
-		Unique: false,
-		Sparse: true,
-	})
+func (c *ConnectionContext) EnsureIndex(db, collection string, key []string) error {
+	return c.ensureIndex(db, collection, key, false)
 }
 
 // goroutine safe
-func (c *DialContext) EnsureUniqueIndex(db string, collection string, key []string) error {
-	s := c.Ref()
+func (c *ConnectionContext) EnsureUniqueIndex(db, collection string, key []string) error {
+	return c.ensureIndex(db, collection, key, true)
+}
+
+func (c *ConnectionContext) ensureIndex(db, collection string, key []string, unique bool) error {
+	s, err := c.Ref()
+	if err != nil {
+		return err
+	}
 	defer c.UnRef(s)
 
-	return s.DB(db).C(collection).EnsureIndex(mgo.Index{
-		Key:    key,
-		Unique: true,
-		Sparse: true,
-	})
+	collectionRef := s.Database(db).Collection(collection)
+	keysDoc := make(bson.D, len(key))
+	for i, k := range key {
+		keysDoc[i] = bson.E{Key: k, Value: 1}
+	}
+
+	indexModel := mongo.IndexModel{
+		Keys:    keysDoc,
+		Options: options.Index().SetUnique(unique).SetSparse(true),
+	}
+	_, err = collectionRef.Indexes().CreateOne(context.Background(), indexModel)
+	return err
 }
